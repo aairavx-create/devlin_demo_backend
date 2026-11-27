@@ -1,20 +1,18 @@
 /**
- * Chatbot data store, kept in MongoDB (collection `chatbot_state`, one document).
+ * Chatbot data store, kept in Postgres (table devlin.chatbot_state, one JSON row).
  * Ported from website-chatbot-dashboard/lib/db.ts, which used a JSON file.
  *
- * Every read-change-save runs through one in-process lock, so a slot check and its
- * booking can't interleave with another request (enough for one server).
- * Production at scale: split into collections and use a Mongo transaction instead.
+ * Every read-change-save runs in a transaction holding a row lock (SELECT ... FOR UPDATE),
+ * so a slot check and its booking can't interleave with another request, even across servers.
  */
 import crypto from 'crypto';
-import mongoose from 'mongoose';
-import { connectDB } from '@/lib/db';
+import type { TransactionSql } from 'postgres';
+import { connectDB, sql } from '@/lib/db';
 import { CONFIG } from './config';
 import { todayYmd, workingDates } from './dates';
 import type { Booking, Conversation, Customer, DB, Message, ServiceRequest, Slot } from './types';
 
 const DB_VERSION = 2;
-const COLLECTION = 'chatbot_state';
 const DOC_ID = 'main';
 
 export const uid = (prefix: string) => `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
@@ -138,30 +136,8 @@ function seed(): DB {
   return db;
 }
 
-// ---------- MongoDB persistence ----------
-type StateDoc = { _id: string; db: DB };
-
-async function collection() {
-  await connectDB();
-  return mongoose.connection.db!.collection<StateDoc>(COLLECTION);
-}
-
-async function read(): Promise<DB | null> {
-  const doc = await (await collection()).findOne({ _id: DOC_ID });
-  return doc?.db ?? null;
-}
-
-async function write(db: DB) {
-  await (await collection()).replaceOne({ _id: DOC_ID }, { db }, { upsert: true });
-}
-
-// One lock for every read-change-save.
-let chain: Promise<unknown> = Promise.resolve();
-function locked<T>(fn: () => Promise<T>): Promise<T> {
-  const run = chain.then(fn, fn);
-  chain = run.catch(() => undefined);
-  return run;
-}
+// ---------- Postgres persistence ----------
+type Tx = TransactionSql;
 
 /** Adds slot days as time moves on. Returns true when it added any. */
 function topUpSlots(db: DB): boolean {
@@ -171,38 +147,54 @@ function topUpSlots(db: DB): boolean {
   return fresh.length > 0;
 }
 
-async function load(): Promise<DB> {
-  let db = await read();
-  if (!db || db.version !== DB_VERSION) {
+async function save(tx: Tx, db: DB) {
+  await tx`update devlin.chatbot_state set db = ${tx.json(db as any)}, updated_at = now() where id = ${DOC_ID}`;
+}
+
+/** Loads the state with its row locked until the transaction ends; seeds it on first use. */
+async function loadLocked(tx: Tx): Promise<DB> {
+  const select = () => tx<{ db: DB }[]>`select db from devlin.chatbot_state where id = ${DOC_ID} for update`;
+  let [row] = await select();
+  if (!row) {
+    await tx`insert into devlin.chatbot_state (id, db) values (${DOC_ID}, ${tx.json(seed() as any)}) on conflict (id) do nothing`;
+    [row] = await select();
+  }
+  let db = row.db;
+  let dirty = false;
+  if (db.version !== DB_VERSION) {
     db = seed();
-    await write(db);
+    dirty = true;
   }
   db.blockedDates ??= [];
-  if (topUpSlots(db)) await write(db);
+  if (topUpSlots(db)) dirty = true;
+  if (dirty) await save(tx, db);
   return db;
 }
 
-export function getDb(): Promise<DB> {
-  return locked(load);
+export async function getDb(): Promise<DB> {
+  await connectDB();
+  return sql.begin((tx) => loadLocked(tx));
 }
 
 /** Read, change and save in one locked step. */
-export function transact<T>(fn: (db: DB) => T): Promise<T> {
-  return locked(async () => {
-    const db = await load();
+export async function transact<T>(fn: (db: DB) => T): Promise<T> {
+  await connectDB();
+  return sql.begin(async (tx) => {
+    const db = await loadLocked(tx);
     const result = fn(db);
     db.rev += 1;
-    await write(db);
+    await save(tx, db);
     return result;
-  });
+  }) as Promise<T>;
 }
 
-export function resetDb(): Promise<void> {
-  return locked(async () => {
-    const old = await read();
+export async function resetDb(): Promise<void> {
+  await connectDB();
+  await sql.begin(async (tx) => {
+    const old = await loadLocked(tx);
     const db = seed();
     db.rev = (old?.rev ?? 0) + 1;
-    await write(db);
+    await save(tx, db);
   });
 }
 

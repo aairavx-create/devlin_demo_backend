@@ -10,7 +10,7 @@ export class HttpError extends Error {
 
 type Handler<C> = (req: NextRequest, ctx: C) => Promise<Response>;
 
-/** Connects to Mongo, runs the handler and turns thrown errors into JSON responses. */
+/** Makes sure the DB schema exists, runs the handler and turns thrown errors into JSON responses. */
 export function route<C = any>(handler: Handler<C>): Handler<C> {
   return async (req, ctx) => {
     try {

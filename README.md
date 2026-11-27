@@ -4,9 +4,9 @@ A standalone Next.js backend (API only) that connects one **main Facebook accoun
 
 - Facebook posts and reels, plus Instagram posts and reels, with likes, comments, shares, saves and reach
 - Ads with spend, impressions, reach, clicks, CTR, CPC and leads
-- Instant-form leads (Facebook and Instagram), saved to MongoDB by sync and by webhook
+- Instant-form leads (Facebook and Instagram), saved to Postgres by sync and by webhook
 
-Tokens (main account + every page) are **AES-256-GCM encrypted** in MongoDB and never returned by the API.
+Tokens (main account + every page) are **AES-256-GCM encrypted** in Postgres and never returned by the API.
 
 The UI lives in `../meta-dashboard`.
 
@@ -18,7 +18,7 @@ npm install
 npm run dev          # http://localhost:4000
 ```
 
-MongoDB: `mongodb://127.0.0.1:27017/meta_agent` (collections: `mainaccounts`, `pages`, `leads`).
+Postgres: set `DATABASE_URL` (Supabase works). Tables are created on first request in the `devlin` schema: `main_accounts`, `pages`, `page_access_requests`, `leads`, `chatbot_state` (see `lib/db.ts`).
 
 ## Meta app setup (one time)
 
@@ -53,7 +53,7 @@ Every route except `/api/health`, `/api/auth/facebook/*` and `/api/webhooks/*` n
 
 | Method | Route | Notes |
 |---|---|---|
-| GET | `/api/health` | Mongo status |
+| GET | `/api/health` | Database status |
 | GET | `/api/auth/facebook/login` | Browser redirect to Facebook |
 | GET | `/api/auth/facebook/callback` | Saves long-lived token, syncs pages, redirects to dashboard |
 | GET / PATCH / DELETE | `/api/account` | Main account info / `{businessId}` / disconnect |
@@ -66,7 +66,7 @@ Every route except `/api/health`, `/api/auth/facebook/*` and `/api/webhooks/*` n
 | GET | `/api/content` | `pageId=all\|<id>&platform=all\|facebook\|instagram&type=all\|post\|reel&limit=12&cursor=&insights=1` |
 | GET | `/api/ads/accounts` | Ad accounts |
 | GET | `/api/ads` | `adAccountId=act_..&datePreset=last_30d&status=ACTIVE&after=` |
-| GET | `/api/leads` | From Mongo: `status` (ALL, NEW, WORKING, UNQUALIFIED, QUALIFIED, CLOSE, INVALID), `pageId, formId, search, fetchStatus, from, to, page, pageSize`. Returns `statusCounts` for the tabs |
+| GET | `/api/leads` | From Postgres: `status` (ALL, NEW, WORKING, UNQUALIFIED, QUALIFIED, CLOSE, INVALID), `pageId, formId, search, fetchStatus, from, to, page, pageSize`. Returns `statusCounts` for the tabs |
 | PATCH | `/api/leads/:id` | `{ status?, followUp?: { at, type: CALL\|WHATSAPP\|EMAIL\|VISIT, notes } \| null }`. Staff fields; Meta sync never overwrites them |
 | POST | `/api/leads/sync` | `{ pageId?, full? }`: incremental pull from every form; also retries failed webhook leads |
 | GET | `/api/leads/forms?pageId=` | Live list of instant forms |
@@ -82,13 +82,13 @@ Run `POST /api/leads/sync` on a schedule (e.g. daily cron) to catch any missed w
 
 ## Website chatbot
 
-Ported from `website-chatbot-dashboard`. Data is stored in MongoDB (collection `chatbot_state`).
+Ported from `website-chatbot-dashboard`. Data is stored in Postgres (table `devlin.chatbot_state`, one JSON row).
 
 | Path | What it does |
 |---|---|
 | `chatbot/config.ts` | **Edit this first.** Business name, time zone, slot times, every bot message, call-back times, sample FAQ |
 | `chatbot/bot.ts` | Bot engine: menu flows, validation, slot check, staff takeover |
-| `chatbot/store.ts` | MongoDB storage with one lock per change (so two chats can't book the same slot) |
+| `chatbot/store.ts` | Postgres storage; each change locks the row (`SELECT ... FOR UPDATE`) so two chats can't book the same slot, even across servers |
 | `chatbot/admin.ts` | Builds the dashboard data |
 
 | Method | Route | Notes |

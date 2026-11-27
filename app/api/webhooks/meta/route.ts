@@ -21,7 +21,10 @@ export async function POST(req: NextRequest) {
   const raw = await req.text();
   const signature = req.headers.get('x-hub-signature-256') || '';
   const expected = 'sha256=' + crypto.createHmac('sha256', env.appSecret).update(raw).digest('hex');
-  if (!safeEqual(signature, expected)) return new NextResponse('Invalid signature', { status: 401 });
+  if (!safeEqual(signature, expected)) {
+    console.warn('[webhook] rejected: invalid signature');
+    return new NextResponse('Invalid signature', { status: 401 });
+  }
 
   let payload: any;
   try {
@@ -39,11 +42,12 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  console.log(`[webhook] received ${pings.length} lead(s): ${pings.map((p) => `${p.leadgen_id} (page ${p.page_id})`).join(', ') || payload.object}`);
   if (pings.length) {
     await connectDB();
     // Answer Meta quickly; fetch lead details in the background. Failures are retried by /api/leads/sync.
     void Promise.allSettled(pings.map((p) => processLeadgenPing(p))).then((rs) =>
-      rs.forEach((r) => r.status === 'rejected' && console.error('[meta-agent] leadgen', r.reason)),
+      rs.forEach((r) => r.status === 'rejected' && console.error('[webhook] lead save failed', r.reason)),
     );
   }
   return NextResponse.json({ received: pings.length });

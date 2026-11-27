@@ -1,9 +1,9 @@
 import { decrypt, encrypt } from '@/lib/crypto';
+import { sql } from '@/lib/db';
 import { env } from '@/lib/env';
 import { graph, graphAll } from '@/lib/graph';
 import { HttpError } from '@/lib/http';
-import { MainAccount } from '@/models/MainAccount';
-import { Page } from '@/models/Page';
+import type { MainAccountRow } from '@/models/types';
 
 export function buildLoginUrl(state: string) {
   const url = new URL(`https://www.facebook.com/${env.graphVersion}/dialog/oauth`);
@@ -42,43 +42,52 @@ export async function connectMainAccount(code: string) {
     params: { fields: 'id,name', limit: 100 },
   }).catch(() => []);
 
-  const existing = await MainAccount.findOne({ fbUserId: me.id });
-  const businessId =
-    existing?.businessId && businesses.some((b) => b.id === existing.businessId) ? existing.businessId : businesses[0]?.id;
+  return sql.begin(async (tx) => {
+    const [existing] = await tx<{ businessId: string | null }[]>`
+      select business_id from devlin.main_accounts where fb_user_id = ${me.id}`;
+    const businessId =
+      existing?.businessId && businesses.some((b) => b.id === existing.businessId) ? existing.businessId : businesses[0]?.id ?? null;
 
-  // Only one main account is active at a time.
-  await MainAccount.updateMany({ fbUserId: { $ne: me.id } }, { isActive: false });
-  const account = await MainAccount.findOneAndUpdate(
-    { fbUserId: me.id },
-    {
+    // Only one main account is active at a time.
+    await tx`update devlin.main_accounts set is_active = false, updated_at = now() where fb_user_id <> ${me.id}`;
+    const row = {
       fbUserId: me.id,
       name: me.name,
-      email: me.email,
-      pictureUrl: me.picture?.data?.url,
+      email: me.email ?? null,
+      pictureUrl: me.picture?.data?.url ?? null,
       accessTokenEnc: encrypt(token),
-      tokenExpiresAt: long.expires_in ? new Date(Date.now() + long.expires_in * 1000) : undefined,
+      tokenExpiresAt: long.expires_in ? new Date(Date.now() + long.expires_in * 1000) : null,
       grantedScopes: perms.filter((p) => p.status === 'granted').map((p) => p.permission),
-      businesses: businesses.map((b) => ({ id: b.id, name: b.name })),
+      businesses: tx.json(businesses.map((b) => ({ id: b.id, name: b.name }))),
       businessId,
       isActive: true,
-    },
-    { upsert: true, new: true },
-  );
-  return account;
+    };
+    const [account] = await tx<MainAccountRow[]>`
+      insert into devlin.main_accounts ${tx(row)}
+      on conflict (fb_user_id) do update set
+        name = excluded.name, email = excluded.email, picture_url = excluded.picture_url,
+        access_token_enc = excluded.access_token_enc, token_expires_at = excluded.token_expires_at,
+        granted_scopes = excluded.granted_scopes, businesses = excluded.businesses,
+        business_id = excluded.business_id, is_active = true, updated_at = now()
+      returning *`;
+    return account;
+  });
 }
 
 export async function requireMainAccount() {
-  const account = await MainAccount.findOne({ isActive: true }).select('+accessTokenEnc');
+  const [account] = await sql<MainAccountRow[]>`
+    select * from devlin.main_accounts where is_active order by updated_at desc limit 1`;
   if (!account) throw new HttpError(409, 'No main account connected. Connect Facebook on the Pages screen first.');
   return { account, token: decrypt(account.accessTokenEnc) };
 }
 
 export async function getMainAccountPublic() {
-  const account = await MainAccount.findOne({ isActive: true }).lean();
+  const [account] = await sql<(MainAccountRow & { pageCount: number })[]>`
+    select a.*, (select count(*)::int from devlin.pages p where p.main_account_id = a.id and p.active) as page_count
+    from devlin.main_accounts a where a.is_active order by a.updated_at desc limit 1`;
   if (!account) return null;
-  const pageCount = await Page.countDocuments({ mainAccountId: account._id, active: true });
   return {
-    id: String(account._id),
+    id: account.id,
     fbUserId: account.fbUserId,
     name: account.name,
     email: account.email,
@@ -88,21 +97,18 @@ export async function getMainAccountPublic() {
     businesses: account.businesses ?? [],
     businessId: account.businessId,
     lastPagesSyncAt: account.lastPagesSyncAt,
-    pageCount,
-    connectedAt: (account as any).createdAt,
+    pageCount: account.pageCount,
+    connectedAt: account.createdAt,
   };
 }
 
 export async function setBusiness(businessId: string) {
   const { account } = await requireMainAccount();
   if (!account.businesses?.some((b) => b.id === businessId)) throw new HttpError(400, 'Unknown business for this account');
-  account.businessId = businessId;
-  await account.save();
+  await sql`update devlin.main_accounts set business_id = ${businessId}, updated_at = now() where id = ${account.id}`;
 }
 
 export async function disconnectMainAccount() {
-  const account = await MainAccount.findOne({ isActive: true });
-  if (!account) return;
-  await Page.deleteMany({ mainAccountId: account._id });
-  await account.deleteOne();
+  // Its pages go with it (on delete cascade). Leads and access-request history are kept.
+  await sql`delete from devlin.main_accounts where is_active`;
 }

@@ -1,13 +1,15 @@
 import { NextResponse } from 'next/server';
-import { connectDB } from '@/lib/db';
+import { connectDB, sql } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
-    const conn = await connectDB();
-    return NextResponse.json({ ok: true, mongo: conn.connection.readyState === 1 ? 'connected' : 'not-ready' });
+    await connectDB();
+    await sql`select 1`;
+    return NextResponse.json({ ok: true, db: 'connected' });
   } catch (err: any) {
-    return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
+    console.error('[meta-agent] health', err);
+    return NextResponse.json({ ok: false, db: 'error' }, { status: 500 });
   }
 }

@@ -1,0 +1,32 @@
+# Backend API — https://api.devlin.aairavx.com
+app = "devlin-aairavx-api"
+# Same region as the Supabase database (ap-southeast-1), so DB round trips stay ~1ms.
+primary_region = "sin"
+
+[build]
+
+[env]
+  META_GRAPH_VERSION = "v23.0"
+  META_REDIRECT_URI = "https://api.devlin.aairavx.com/api/auth/facebook/callback"
+  DASHBOARD_URL = "https://devlin.aairavx.com"
+  CORS_ORIGINS = "https://devlin.aairavx.com"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/health"
+    timeout = "5s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
